@@ -1,0 +1,282 @@
+diff --git a/www/api/controllers/proxies.php b/www/api/controllers/proxies.php
+index ac0b3fd..c64a099 100644
+--- a/www/api/controllers/proxies.php
++++ b/www/api/controllers/proxies.php
+@@ -90,7 +90,9 @@ function LoadProxyList()
+         }
+     }
+ 
+-    $leases = getDHCPLeases();
++    $leaseDetails = getDHCPLeaseDetails();
++    $leases = array_keys($leaseDetails);
++    $customNames = LoadDHCPProxyNames();
+     foreach ($leases as $ip) {
+         $alreadyExists = false;
+         foreach ($proxies as $proxy) {
+@@ -109,6 +111,8 @@ function LoadProxyList()
+     foreach ($proxies as &$proxy) {
+         if (in_array($proxy['host'], $leases)) {
+             $proxy['dhcp'] = true;
++            $proxy['mac'] = $leaseDetails[$proxy['host']];
++            $proxy['customName'] = $customNames[$proxy['mac']] ?? '';
+             // Only set pending if not already set (i.e., was just added above)
+             if (!isset($proxy['pending'])) {
+                 $proxy['pending'] = false;
+@@ -470,6 +474,12 @@ function GetProxiedURL()
+  * @return array Array of IPv4 address strings.
+  */
+ function getDHCPLeases()
++{
++    return array_keys(getDHCPLeaseDetails());
++}
++
++/** Return offered IPv4 leases keyed by IP, with normalized MAC addresses. */
++function getDHCPLeaseDetails()
+ {
+     $dhcpIps = array();
+     $interfaces = network_list_interfaces_array();
+@@ -492,8 +502,12 @@ function getDHCPLeases()
+                 if ($pos === false) {
+                     $inLeases = false;
+                 } else {
+-                    $line = trim(substr($line, 0, $pos));
+-                    $dhcpIps[] = $line;
++                    $ip = trim(substr($line, 0, $pos));
++                    $mac = '';
++                    if (preg_match('/\(to ([0-9a-f]{2}(?::[0-9a-f]{2}){5})\)/i', $line, $match)) {
++                        $mac = strtolower($match[1]);
++                    }
++                    $dhcpIps[$ip] = $mac;
+                 }
+             }
+         }
+@@ -528,3 +542,78 @@ function DeleteAllProxies()
+     GenerateBackupViaAPI('All proxies were deleted.');
+     return json([]);
+ }
++
++
++/** Read persistent labels without changing DHCP or Apache configuration. */
++function LoadDHCPProxyNames()
++{
++    global $settings;
++    $path = $settings['mediaDirectory'] . '/config/dhcp-proxy-names.json';
++    if (!file_exists($path)) {
++        return [];
++    }
++    $data = json_decode(file_get_contents($path), true);
++    if (!is_array($data)) {
++        throw new RuntimeException('Unable to read saved DHCP custom names.');
++    }
++    return $data;
++}
++
++/**
++ * Merge changed labels by MAC address; an empty name removes a label.
++ * @route POST /api/proxies/dhcp-names
++ * @body [{"mac":"aa:bb:cc:dd:ee:ff","customName":"Mega Tree"}]
++ */
++function PostDHCPProxyNames()
++{
++    global $settings;
++    $changes = $_POST;
++    if (!is_array($changes) || !array_is_list($changes)) {
++        http_response_code(400);
++        return json(['error' => 'Expected an array of custom names.']);
++    }
++    foreach ($changes as $change) {
++        if (!is_array($change) || !isset($change['mac'], $change['customName']) ||
++            !is_string($change['mac']) || !is_string($change['customName']) ||
++            !preg_match('/^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/i', $change['mac']) ||
++            !preg_match('/^.{0,128}$/us', $change['customName']) ||
++            preg_match('/[\x00-\x1f\x7f]/', $change['customName'])) {
++            http_response_code(400);
++            return json(['error' => 'Each name needs a valid MAC address and at most 128 characters without control characters.']);
++        }
++    }
++    $path = $settings['mediaDirectory'] . '/config/dhcp-proxy-names.json';
++    $lock = fopen($path . '.lock', 'c');
++    if (!$lock || !flock($lock, LOCK_EX)) {
++        if ($lock) fclose($lock);
++        http_response_code(500);
++        return json(['error' => 'Unable to lock custom names for saving.']);
++    }
++    $temporary = false;
++    try {
++        $names = LoadDHCPProxyNames();
++        foreach ($changes as $change) {
++            $mac = strtolower($change['mac']);
++            $name = trim($change['customName']);
++            if ($name === '') {
++                unset($names[$mac]);
++            } else {
++                $names[$mac] = $name;
++            }
++        }
++        $encoded = json_encode((object)$names, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . "\n";
++        $temporary = tempnam(dirname($path), '.dhcp-names-');
++        if (!$temporary || file_put_contents($temporary, $encoded) !== strlen($encoded) ||
++            !chmod($temporary, 0664) || !rename($temporary, $path)) {
++            throw new RuntimeException('Unable to save DHCP custom names.');
++        }
++        return json(['status' => 'OK', 'names' => (object)$names]);
++    } catch (Throwable $error) {
++        http_response_code(500);
++        return json(['error' => $error->getMessage()]);
++    } finally {
++        if ($temporary && file_exists($temporary)) unlink($temporary);
++        flock($lock, LOCK_UN);
++        fclose($lock);
++    }
++}
+diff --git a/www/api/index.php b/www/api/index.php
+index 3ce71ff..59f18e2 100644
+--- a/www/api/index.php
++++ b/www/api/index.php
+@@ -246,6 +246,7 @@ dispatch_post('/plugin/:RepoName/upgrade', 'UpgradePlugin');
+ dispatch_get('/proxies', 'GetProxies');
+ dispatch_post('/proxies', 'PostProxies');
+ dispatch_delete('/proxies', 'DeleteAllProxies');
++dispatch_post('/proxies/dhcp-names', 'PostDHCPProxyNames');
+ dispatch_post('/proxies/:ProxyIp', 'AddProxy');
+ dispatch_delete('/proxies/:ProxyIp', 'DeleteProxy');
+ 
+diff --git a/www/proxies.php b/www/proxies.php
+index 74672fa..c91562d 100644
+--- a/www/proxies.php
++++ b/www/proxies.php
+@@ -141,19 +141,66 @@
+                 "</td></tr>");
+         }
+ 
+-        function AddProxyForDHCPHost(host, description = "") {
+-            var currentRows = $("#DHCPproxyTable > tbody > tr").length;
++        let savingDHCPNames = false;
+ 
+-            let descCellId = "dhcpDesc_" + host.replace(/\./g, "_");
++        function DHCPNameChanges() {
++            return $('#DHCPproxyTable .customName').toArray().filter(function (input) {
++                return !input.disabled && input.value !== $(input).data('savedName');
++            });
++        }
+ 
+-            $("#DHCPproxyTable tbody").append(
+-                "<tr class=''>" +
+-                "<td>" + (currentRows + 1) + "</td>" +
+-                "<td>&nbsp;&nbsp;&nbsp;" + host + "</td>" +
+-                "<td id='" + descCellId + "'>&nbsp;&nbsp;&nbsp;" + description + "</td>" +
+-                "<td><a target='_blank' href='proxy/" + host + "/'>" + host + "</a></td>" +
+-                "</tr>"
+-            );
++        function UpdateDHCPNamesSaveState() {
++            const dirty = DHCPNameChanges().length > 0;
++            $('#btnSaveDHCPNames').prop('disabled', savingDHCPNames || !dirty)
++                .text(savingDHCPNames ? 'Saving…' : 'Save Names');
++            $('#dhcpNamesStatus').text(dirty ? 'Unsaved names' : '');
++        }
++
++        function SaveDHCPNames() {
++            const inputs = DHCPNameChanges();
++            if (savingDHCPNames || !inputs.length) return;
++            const changes = inputs.map(function (input) {
++                return {mac: $(input).data('mac'), customName: input.value};
++            });
++            savingDHCPNames = true;
++            UpdateDHCPNamesSaveState();
++            $.ajax({
++                url: 'api/proxies/dhcp-names', type: 'POST',
++                contentType: 'application/json', dataType: 'json',
++                data: JSON.stringify(changes),
++                success: function (data) {
++                    inputs.forEach(function (input, index) {
++                        const saved = data.names[changes[index].mac] || '';
++                        $(input).data('savedName', saved);
++                        if (input.value === changes[index].customName) input.value = saved;
++                    });
++                    $.jGrowl('Custom names saved', {themeState: 'success'});
++                },
++                error: function () {
++                    $.jGrowl('Unable to save custom names. Your edits are still here; please try again.', {themeState: 'danger'});
++                },
++                complete: function () {
++                    savingDHCPNames = false;
++                    UpdateDHCPNamesSaveState();
++                }
++            });
++        }
++
++        function AddProxyForDHCPHost(host, description = "", customName = "", mac = "") {
++            const row = $('<tr>');
++            $('<td>').text($('#DHCPproxyTable > tbody > tr').length + 1).appendTo(row);
++            $('<td>').text(host).appendTo(row);
++            const input = $('<input>', {
++                type: 'text', class: 'customName', maxlength: 128, size: 28,
++                'aria-label': 'Custom name for ' + host,
++                placeholder: mac ? 'Enter a name' : 'MAC address unavailable'
++            }).val(customName).prop('disabled', !mac)
++                .data('mac', mac).data('savedName', customName)
++                .on('input', UpdateDHCPNamesSaveState);
++            $('<td>').append(input).appendTo(row);
++            $('<td>', {id: 'dhcpDesc_' + host.replace(/\./g, '_')}).text(description).appendTo(row);
++            $('<td>').append($('<a>', {target: '_blank', href: 'proxy/' + host + '/'}).text(host)).appendTo(row);
++            $('#DHCPproxyTable tbody').append(row);
+         }
+ 
+         function RenumberColumns(tableName) {
+@@ -264,6 +311,12 @@
+         $(document).ready(function () {
+ 
+             SetupSelectableTableRow(tableInfo);
++            window.addEventListener('beforeunload', function (event) {
++                if (DHCPNameChanges().length) {
++                    event.preventDefault();
++                    event.returnValue = '';
++                }
++            });
+ 
+             $.ajax({
+                 url: 'api/proxies',
+@@ -274,7 +327,7 @@
+                     proxyInfos = data;
+                     for (var i = 0; i < proxyInfos.length; i++) {
+                         if (proxyInfos[i].dhcp) {
+-                            AddProxyForDHCPHost(proxyInfos[i].host, proxyInfos[i].description);
++                            AddProxyForDHCPHost(proxyInfos[i].host, proxyInfos[i].description, proxyInfos[i].customName || "", proxyInfos[i].mac || "");
+                         } else {
+                             AddProxyForHost(proxyInfos[i].host, proxyInfos[i].description);
+                         }
+@@ -292,7 +345,7 @@
+                                         if (data && data.HostName) {
+                                             let cell = $("#" + descCellId);
+                                             // Set Description for DHCP
+-                                            cell.html("DHCP (FPP Instance: " + data.HostName + ")");
++                                            cell.text("DHCP (FPP Instance: " + data.HostName + ")");
+                                         }
+                                     },
+                                     error: function () {
+@@ -391,9 +444,15 @@
+                     </div>
+ 
+ 
+-                    <div class="col-md">
+-                        <h2>DHCP Proxied Hosts (Auto Populated)</h2>
++                    <div class="row tablePageHeader">
++                        <div class="col-md"><h2>DHCP Proxied Hosts (Auto Populated)</h2></div>
++                        <div class="col-md-auto ms-lg-auto form-actions">
++                            <span id="dhcpNamesStatus" role="status" class="me-2"></span>
++                            <button id="btnSaveDHCPNames" type="button" class="buttons btn btn-success"
++                                onclick="SaveDHCPNames();" disabled>Save Names</button>
++                        </div>
+                     </div>
++                    <p>Custom names stay with each device when its IP address changes. Clear a name and save to remove it.</p>
+ 
+ 
+                     <div class="fppTableWrapper fppTableWrapperAsTable">
+@@ -404,6 +463,7 @@
+                                     <tr>
+                                         <th>#</td>
+                                         <th>IP/HostName</td>
++                                        <th>Custom Name</th>
+                                         <th>Description</td>
+                                         <th>
+                                             <? if (!$settings['hideExternalURLs']) { ?>
