@@ -61,12 +61,53 @@ Python 3.8+ and OpenSSH are required on the sending computer. FPP needs Python 3
 
 ## Run directly on FPP instead
 
-Copy the three code files to the player, keep them together, and run:
+These steps copy the installer to your player and run it over SSH. Replace
+`10.10.11.1` with your player's IP address and `fpp` with your SSH user name
+if different. Enter the player's SSH password when prompted.
 
-```sh
-python3 install.py --local --check
-sudo python3 install.py --local
-```
+1. **On your computer**, open a terminal in the downloaded or cloned repository
+   folder containing `install.py`, `custom-names.patch`, and
+   `dhcp-custom-names.php`.
+
+2. Create a folder on the player, then copy all three files into it:
+
+   ```sh
+   ssh fpp@10.10.11.1 'mkdir -p ~/fpp-dhcp-custom-names'
+   scp install.py custom-names.patch dhcp-custom-names.php fpp@10.10.11.1:~/fpp-dhcp-custom-names/
+   ```
+
+3. Connect to the player:
+
+   ```sh
+   ssh fpp@10.10.11.1
+   ```
+
+4. **In the SSH session on FPP**, open that folder and check compatibility:
+
+   ```sh
+   cd ~/fpp-dhcp-custom-names
+   python3 install.py --local --check
+   ```
+
+5. If the compatibility check passes, install the feature:
+
+   ```sh
+   sudo python3 install.py --local
+   ```
+
+   If it says the feature is already installed, no further installation is
+   needed. If the check reports an incompatibility, stop and do not force the
+   patch.
+
+6. Refresh the player's **Proxy Settings** page to see the **Custom Name**
+   column. No restart is required. To close the SSH session:
+
+   ```sh
+   exit
+   ```
+
+The `--local` option means the installer runs on the player you are connected
+to; the connection defaults in `install.py` are not used in this mode.
 
 Use `--root` and `--media-dir` if FPP is installed outside `/opt/fpp` and `/home/fpp/media`.
 
